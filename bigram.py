@@ -3,6 +3,13 @@ import torch.nn as nn
 from torch.nn import functional as F
 torch.manual_seed(117)
 
+#hyperparams
+training_steps = 10000
+block_size = 8
+batch_size = 4
+learning_rate = 1e-3
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
 #load dataset
 with open('./dataset/input.txt', 'r', encoding='utf-8') as file:
     text = file.read()
@@ -15,23 +22,20 @@ stoi = { ch: i for i, ch in enumerate(chars) }
 itos = { i: ch for i, ch in enumerate(chars) }
 encode = lambda s: [stoi[c] for c in s]
 decode = lambda l: ''.join([itos[i] for i in l])
-
 #dataset creation
 dataset = torch.tensor(encode(text), dtype=torch.long)
-
 #train/val split
 split_size = int(0.9*len(dataset))
 train = dataset[:split_size]
 val = dataset[split_size:]
 
 #data loader
-block_size = 8
-batch_size = 4
 def Generate_Batch(split):
     data = train if split == 'train' else val
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([data[i:i+block_size] for i in ix])
     y = torch.stack([data[i+1:i+block_size+1] for i in ix])
+    x, y = x.to(device), y.to(device)
     return x, y
 
 #bigram model
@@ -66,10 +70,10 @@ class BigramModel(nn.Module):
         return idx
     
 m = BigramModel(vocab_size)
-training_steps = 10000
+m = m.to(device)
 
 #training loop
-optimizer = torch.optim.AdamW(m.parameters(), lr=1e-3)
+optimizer = torch.optim.AdamW(m.parameters(), lr=learning_rate)
 for step in range(training_steps):
     xb, yb = Generate_Batch('train')
     logits, loss = m(xb, yb)
@@ -78,4 +82,4 @@ for step in range(training_steps):
     loss.backward()
     optimizer.step()
 
-print(decode(m.generate(idx=torch.zeros((1,1), dtype=torch.long), max_tokens=500)[0].tolist()))
+print(decode(m.generate(idx=torch.zeros((1,1), dtype=torch.long, device=device), max_tokens=500)[0].tolist()))
