@@ -150,7 +150,7 @@ class GPT(nn.Module):
         self.mha = nn.Sequential(*[DecoderBlock() for _ in range(num_blocks)])
         self.ln = LayerNorm()
         self.lm_head = nn.Linear(embed_dim, vocab_size)
-        self._init_weights(self._init_weights)
+        self.apply(self._init_weights)
 
     def forward(self, x, y = None):
         x = self.embedding(x)
