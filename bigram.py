@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import torch.backends.mps as mps
+from torch.optim.adamw import AdamW
 torch.manual_seed(117)
 
 #hyperparams
@@ -8,7 +10,14 @@ training_steps = 10000
 block_size = 8
 batch_size = 4
 learning_rate = 1e-3
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+if torch.cuda.is_available():
+    device = 'cuda'
+elif mps.is_available():
+    device = 'mps'
+else:
+    device = 'cpu'
+
+print(f'device is {device}')
 
 #load dataset
 with open('./dataset/input.txt', 'r', encoding='utf-8') as file:
@@ -46,13 +55,13 @@ class BigramModel(nn.Module):
 
     def forward(self, idx, targets = None):
         logits = self.embedding_table(idx) #(B,T,C)
-        if targets == None:
+        if targets is None:
             loss = None
         else:
             B, T, C = logits.shape
             #need to change shape to ensure compatibility with cross-entropy
-            logits = logits.view(B*T, C)
-            targets = targets.view(B*T)
+            logits = logits.reshape(B*T, C)
+            targets = targets.reshape(B*T)
             loss = F.cross_entropy(logits, targets)
         return logits, loss
     
@@ -73,7 +82,7 @@ m = BigramModel(vocab_size)
 m = m.to(device)
 
 #training loop
-optimizer = torch.optim.AdamW(m.parameters(), lr=learning_rate)
+optimizer = AdamW(m.parameters(), lr=learning_rate)
 for step in range(training_steps):
     xb, yb = Generate_Batch('train')
     logits, loss = m(xb, yb)
