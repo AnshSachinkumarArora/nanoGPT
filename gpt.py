@@ -4,6 +4,7 @@ from torch.nn import functional as F
 import torch.backends.mps as mps
 from torch.optim.adamw import AdamW
 torch.manual_seed(117)
+#import tiktoken
 
 #load dataset
 with open('./dataset/input.txt', 'r', encoding='utf-8') as file:
