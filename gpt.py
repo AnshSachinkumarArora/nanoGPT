@@ -88,6 +88,13 @@ class Embedding(nn.Module):
         embedded = self.embedding(tokens)
         combined = embedded + positions
         return combined
+    
+class RoPE(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        pos = torch.arange(block_size, device=device)
+        freq = 1/(10000**(2*(torch.arange(head_dim/2, device=device) - 1))/head_dim)
+
 
 class CausalSelfAttention(nn.Module):
     def __init__(self) -> None:
