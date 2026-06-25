@@ -77,23 +77,42 @@ class Embedding(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.positional = nn.Embedding(block_size, embed_dim)
     
-    def forward(self, tokens, cache_pos=0):
-        T = tokens.shape[1]
-        if T == 1:
-            positions = self.positional(torch.tensor([cache_pos], device=device))
-        else:
-            positions = self.positional(torch.arange(T, device=device))
+    def forward(self, tokens):
         embedded = self.embedding(tokens)
-        combined = embedded + positions
-        return combined
+        return embedded
     
 class RoPE(nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        #setting up positions and frequencies
         pos = torch.arange(block_size, device=device)
-        freq = 1/(10000**(2*(torch.arange(head_dim/2, device=device) - 1))/head_dim)
+        freq = 1/(10000**(torch.arange(0, head_dim, 2).float()/head_dim))
+        pos_freq = torch.outer(pos, freq)
+        sin_cache = torch.sin(pos_freq)
+        cos_cache = torch.cos(pos_freq)
+        #setting up sin and cos caches
+        self.register_buffer('sin_cache', torch.cat((sin_cache, sin_cache), dim=1))
+        self.register_buffer('cos_cache', torch.cat((cos_cache, cos_cache), dim=1))
+
+    def forward(self, q, k, start_pos=0):
+        B, nh, T, hs = q.shape
+        #splitting and negating
+        q_split = self.neg_split(q)
+        k_split = self.neg_split(k)
+        #getting correct cache values
+        sin = self.sin_cache[start_pos : start_pos + T, :]
+        cos = self.cos_cache[start_pos : start_pos + T, :]
+        #performing RoPE
+        pos_embedded_q = (q * cos) + (q_split * sin)
+        pos_embedded_k = (k * cos) + (k_split * sin)
+        return pos_embedded_q, pos_embedded_k
+    
+    #helper function to negate second half of tensor dim -1 and flip it
+    def neg_split(self, x):
+        x1, x2 = torch.chunk(x, chunks=2, dim=-1)
+        output = torch.cat((-x2, x1), dim=-1)
+        return output
 
 
 class CausalSelfAttention(nn.Module):
