@@ -87,7 +87,7 @@ class RoPE(nn.Module):
         super().__init__(*args, **kwargs)
         #setting up positions and frequencies
         pos = torch.arange(max_seq_len, device=device)
-        freq = 1/(10000**(torch.arange(0, head_dim, 2).float()/head_dim))
+        freq = 1/(10000**(torch.arange(0, head_dim, 2).float()/head_dim)).to(device=device)
         pos_freq = torch.outer(pos, freq)
         sin_cache = torch.sin(pos_freq)
         cos_cache = torch.cos(pos_freq)
