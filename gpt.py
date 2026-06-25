@@ -31,7 +31,7 @@ num_blocks = 1
 learning_rate = 6e-4
 dataset_path = 'dataset/dataset.bin'
 encoder = tiktoken.get_encoding('cl100k_base')
-max_tokens = 256
+max_seq_len = 1024
 
 #basic encoding and decoding
 '''stoi = { ch: i for i, ch in enumerate(chars) }
@@ -86,7 +86,7 @@ class RoPE(nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         #setting up positions and frequencies
-        pos = torch.arange(block_size, device=device)
+        pos = torch.arange(max_seq_len, device=device)
         freq = 1/(10000**(torch.arange(0, head_dim, 2).float()/head_dim))
         pos_freq = torch.outer(pos, freq)
         sin_cache = torch.sin(pos_freq)
@@ -122,10 +122,11 @@ class CausalSelfAttention(nn.Module):
         self.output_weights = nn.Linear(embed_dim, embed_dim, bias=False)
         self.output_weights.NANOGPT_SCALE_INIT = 1
         self.register_buffer('causal_mask', torch.tril(torch.ones(block_size, block_size)))
-        self.k_cache = torch.zeros(batch_size, num_heads, block_size, head_dim)
-        self.v_cache = torch.zeros(batch_size, num_heads, block_size, head_dim)
+        self.register_buffer('k_cache', torch.zeros(batch_size, num_heads, block_size, head_dim))
+        self.register_buffer('v_cache', torch.zeros(batch_size, num_heads, block_size, head_dim))
+        self.rope = RoPE()
 
-    def forward(self, tokens, use_cache=False, cache_pos=0):
+    def forward(self, tokens, use_cache=False, absolute_pos=0):
         B, T, C = tokens.shape
         wei = self.weights(tokens) #(B, T, 3C)
 
@@ -139,8 +140,9 @@ class CausalSelfAttention(nn.Module):
         k = k.reshape(B, T, num_heads, head_dim).transpose(1, 2)
         v = v.reshape(B, T, num_heads, head_dim).transpose(1, 2)
 
-        #TRAINING MODE
+        #TRAINING 
         if use_cache is False:
+            q, k = self.rope(q, k)
             #calculate scaled QK^t, shape (B, T, T)
             qkt = q @ k.transpose(-2, -1)
             qkt_scaled = qkt * k.shape[-1]**(-0.5)
@@ -148,26 +150,20 @@ class CausalSelfAttention(nn.Module):
             qkt_softmax = F.softmax(qkt_masked, dim=-1)
             #calculating scaled dot product attention, shape (B, T, C)
             scaled_dot_attn = qkt_softmax @ v
-        #INFERENCE MODE
+        #INFERENCE 
         else:
-            #cache is full
-            if cache_pos >= block_size:
-                #remove last time step
-                self.k_cache = torch.roll(self.k_cache, shifts=-1, dims=2)
-                self.v_cache = torch.roll(self.v_cache, shifts=-1, dims=2)
-                #append new values to the end
-                self.k_cache[:B, :, -1, :] = k
-                self.v_cache[:B, :, -1, :] = v
-                #retrieve kv values
+            q, k = self.rope(q, k, start_pos=absolute_pos)
+            cache_pos = absolute_pos % block_size
+            #append to cache
+            self.k_cache[:B, :, cache_pos:cache_pos+1, :] = k
+            self.v_cache[:B, :, cache_pos:cache_pos+1, :] = v
+            #get correct number of kv values
+            if absolute_pos < block_size:
+                k_hist = self.k_cache[:B, :, :absolute_pos+1, :]
+                v_hist = self.v_cache[:B, :, :absolute_pos+1, :]
+            else:
                 k_hist = self.k_cache[:B, :, :, :]
                 v_hist = self.v_cache[:B, :, :, :]
-            else:
-                #append to cache
-                self.k_cache[:B, :, cache_pos:cache_pos+1, :] = k
-                self.v_cache[:B, :, cache_pos:cache_pos+1, :] = v
-                #get correct number of kv values
-                k_hist = self.k_cache[:B, :, :cache_pos+1, :]
-                v_hist = self.v_cache[:B, :, :cache_pos+1, :]
 
             #perform attention calculation
             qkt = q @ k_hist.transpose(-2, -1)
@@ -206,8 +202,8 @@ class DecoderBlock(nn.Module):
         self.ln2 = LayerNorm()
         self.mlp = MLP()
 
-    def forward(self, x, use_cache=False, cache_pos=0):
-        x = x + self.attn(self.ln1(x), use_cache, cache_pos)
+    def forward(self, x, use_cache=False, absolute_pos=0):
+        x = x + self.attn(self.ln1(x), use_cache, absolute_pos)
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -220,10 +216,10 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(embed_dim, vocab_size)
         self.apply(self._init_weights)
 
-    def forward(self, x, y=None, use_cache=False, cache_pos=0):
+    def forward(self, x, y=None, use_cache=False, absolute_pos=0):
         x = self.embedding(x)
         for layer in self.mha:
-            x = layer(x, use_cache=use_cache, cache_pos=cache_pos)
+            x = layer(x, use_cache=use_cache, absolute_pos=absolute_pos)
         x = self.ln(x)
         logits = self.lm_head(x)
 
@@ -237,19 +233,20 @@ class GPT(nn.Module):
         
         return logits, loss
     
-    def generate(self, idx, max_tokens, use_cache=False, cache_pos=0):
+    def generate(self, idx, max_tokens, use_cache=False):
+        absolute_pos=0
         for _ in range(max_tokens):
             idx = idx if idx.shape[-1] <= block_size else idx[:, -block_size:]
             if use_cache is False:
-                logits, _ = self(idx, use_cache=use_cache, cache_pos=cache_pos)
+                logits, _ = self(idx, use_cache=use_cache, absolute_pos=absolute_pos)
             else:
-                latest_token = idx[:, -1]
-                cache_pos = idx.shape[-1] - 1
-                logits, _ = self(latest_token, use_cache=use_cache, cache_pos=cache_pos)
+                latest_token = idx[:, -1:]
+                logits, _ = self(latest_token, use_cache=use_cache, absolute_pos=absolute_pos)
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
+            absolute_pos += 1
         return idx
     
     def _init_weights(self, module):
@@ -283,4 +280,4 @@ for step in range(num_iters):
     if step % 100 == 0: print(f'the loss is {loss_accumulator} on step {step}')
     optimizer.step()
 
-print(encoder.decode(model.generate(idx=torch.zeros((1,1), dtype=torch.long, device=device), max_tokens=min(max_tokens, 256), use_cache=True)[0].tolist()))
+print(encoder.decode(model.generate(idx=torch.zeros((1,1), dtype=torch.long, device=device), max_tokens=min(max_seq_len, 256), use_cache=True)[0].tolist()))
