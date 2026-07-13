@@ -8,27 +8,30 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 torch.manual_seed(0)
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+def alloc_fn(size: int, alignment: int, stream: Optional[int]):
+    return torch.empty(size, device="cuda", dtype=torch.int8)
+
+triton.set_allocator(alloc_fn)
+
+#++++++++++++++ MY FLASH ATTENTION 2 IMPLEMENTATION START ++++++++++++++
 
 @triton.jit
 def flash_attn_fwd_inner(q, o_i, m_i, l_i, N,
-                        k_offs, v_offs, m_offs, kv_offs,
+                        k, v, m_offs, n_offs,
                         qk_scale_log2,
                         STAGE: tl.constexpr):
-    #get offsets and load
-    mask_kv = kv_offs[:, None] < N
-    k = tl.load(k_offs, mask=mask_kv, other=0.0)
-    kt = tl.trans(k)
-    v = tl.load(v_offs, mask=mask_kv, other=0.0)
+    #calculate masks
+    mask_n = n_offs[None, :] < N
+    mask_m = m_offs[:, None] < N
 
     #calculate attention
-    s_i = tl.dot(q, kt, allow_tf32=False)
-    mask_s = kv_offs[None, :] < N
-    s_i = tl.where(mask_s, s_i, float('-inf'))
+    s_i = tl.dot(q, tl.trans(k), allow_tf32=False)
+    s_i = tl.where(mask_n, s_i, float('-inf'))
+    s_i = tl.where(mask_m, s_i, float('-inf'))
 
     #apply causal mask during training
     if STAGE == 2:
-        mask_qkt = m_offs[:, None] < kv_offs[None, :]
+        mask_qkt = m_offs[:, None] < n_offs[None, :]
         s_i = tl.where(mask_qkt, float('-inf'), s_i)
 
     #resume attention calculation
@@ -44,11 +47,16 @@ def flash_attn_fwd_inner(q, o_i, m_i, l_i, N,
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_warps=8, num_stages=3),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_warps=8, num_stages=2),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=4, num_stages=3),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_warps=8, num_stages=3),
         triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128}, num_warps=8, num_stages=3),
         triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_warps=8, num_stages=3),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_warps=8, num_stages=2),
     ],
@@ -56,7 +64,7 @@ def flash_attn_fwd_inner(q, o_i, m_i, l_i, N,
 )
 @triton.jit
 def flash_attn_fwd_kernel_2(Q, K, V, O, L, #input/output matrices
-                            B, H, N, #matrix shapes
+                            B, H, N, D, #matrix shapes
                             stride_qb, stride_qh, stride_qn, stride_qd, #strides for matrix shapes
                             stride_kb, stride_kh, stride_kn, stride_kd,
                             stride_vb, stride_vh, stride_vn, stride_vd,
@@ -85,11 +93,18 @@ def flash_attn_fwd_kernel_2(Q, K, V, O, L, #input/output matrices
     m_end = min((pid_m + 1) * BLOCK_M, N) if causal else N
     m_offs = m_start + tl.arange(0, BLOCK_M)
     d_offs = tl.arange(0, BLOCK_D)
-    q_offs = base_q_offs + (m_offs[:, None]) * stride_qn + (d_offs[None, :]) * stride_qd
+
+    #make tensor descriptors
+    q_desc = tl.make_tensor_descriptor(base_q_offs, [N, D],
+                                       [stride_qn, stride_qd], [BLOCK_M, BLOCK_D])
+    k_desc = tl.make_tensor_descriptor(base_k_offs, [N, D],
+                                       [stride_kn, stride_kd], [BLOCK_N, BLOCK_D])
+    v_desc = tl.make_tensor_descriptor(base_v_offs, [N, D],
+                                       [stride_vn, stride_vd], [BLOCK_N, BLOCK_D])
 
     #load data/setup matrices
     mask_q = m_offs[:, None] < N
-    q = tl.load(q_offs, mask=mask_q, other=0.0)
+    q = q_desc.load([m_start, 0])
     o_i = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
     l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
     m_i = tl.zeros((BLOCK_M,), dtype=tl.float32) + float('-inf')
@@ -106,13 +121,13 @@ def flash_attn_fwd_kernel_2(Q, K, V, O, L, #input/output matrices
             STAGE = 1 if m_start >= n_end else 2
 
         #calculate offsets
-        kv_offs = n_start + tl.arange(0, BLOCK_N)
-        k_offs = base_k_offs + (kv_offs[:, None]) * stride_kn + (d_offs[None, :]) * stride_kd
-        v_offs = base_v_offs + (kv_offs[:, None]) * stride_vn + (d_offs[None, :]) * stride_vd
+        n_offs = n_start + tl.arange(0, BLOCK_N)
+        k = k_desc.load([n_start, 0])
+        v = v_desc.load([n_start, 0])
 
         #perform inner loop
         o_ij, l_ij, m_ij = flash_attn_fwd_inner(q, o_i, m_i, l_i, N,
-                                                k_offs, v_offs, m_offs, kv_offs,
+                                                k, v, m_offs, n_offs,
                                                 qk_scale_log2,
                                                 STAGE)
 
@@ -152,13 +167,17 @@ def flash_attn_bwd_dk_dv_inner(q, k, v, l, d, do, N,
     dv = tl.dot(tl.trans(p_i.to(do.dtype)), do, allow_tf32=False)
     dp = tl.dot(do, tl.trans(v), allow_tf32=False)
     ds = p_i * (dp - d[:, None])
-    dk = tl.dot(tl.trans(ds), q.to(ds.dtype), allow_tf32=False) * qk_scale
+    dk = tl.dot(tl.trans(ds.to(q.dtype)), q, allow_tf32=False) * qk_scale
 
     return dk, dv
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_N': 64, 'BLOCK_M': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_warps=8, num_stages=3),
         triton.Config({'BLOCK_N': 64, 'BLOCK_M': 64}, num_warps=8, num_stages=2),
         triton.Config({'BLOCK_N': 32, 'BLOCK_M': 64}, num_warps=4, num_stages=2),
         triton.Config({'BLOCK_N': 32, 'BLOCK_M': 32}, num_warps=8, num_stages=2),
@@ -185,7 +204,16 @@ def flash_attn_bwd_dk_dv(Q, K, V, dO, dK, dV, L, delta,
     batch = pid_bh // H
     head = pid_bh % H
 
-    #get base offsets
+    #get base offsets and masks
+    n_start = pid_n * BLOCK_N
+    n_start = tl.multiple_of(n_start, BLOCK_N)
+    n_end = min((pid_n + 1) * BLOCK_N, N)
+    offs_n = n_start + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_n_store = offs_n[:, None] < N
+    mask_n = offs_n[None, :] < N
+    inner_loop_start = n_start if causal else 0
+    offs_m = inner_loop_start + tl.arange(0, BLOCK_M)
     base_q_offs = Q + (batch * stride_qb) + (head * stride_qh)
     base_k_offs = K + (batch * stride_kb) + (head * stride_kh)
     base_v_offs = V + (batch * stride_vb) + (head * stride_vh)
@@ -194,38 +222,23 @@ def flash_attn_bwd_dk_dv(Q, K, V, dO, dK, dV, L, delta,
     base_do_offs = dO + (batch * stride_dob) + (head * stride_doh)
     base_dk_offs = dK + (batch * stride_dkb) + (head * stride_dkh)
     base_dv_offs = dV + (batch * stride_dvb) + (head * stride_dvh)
+    d_offs = base_delta_offs + (offs_m) * stride_del_n
+    l_offs = base_l_offs + (offs_m) * stride_ln
 
     #make block pointers for TMA
-    n_start = pid_n * BLOCK_N
-    n_start = tl.multiple_of(n_start, BLOCK_N)
-    n_end = min((pid_n + 1) * BLOCK_N, N)
-    inner_loop_start = n_start if causal else 0
-    q_blk = tl.make_block_ptr(base_q_offs, (N, D),
-                            (stride_qn, stride_qd), (inner_loop_start, 0),
-                            (BLOCK_M, BLOCK_D), (1, 0))
-    k_blk = tl.make_block_ptr(base_k_offs, (N, D),
-                            (stride_kn, stride_kd), (n_start, 0),
-                            (BLOCK_N, BLOCK_D), (1, 0))
-    v_blk = tl.make_block_ptr(base_v_offs, (N, D),
-                            (stride_vn, stride_vd), (n_start, 0),
-                            (BLOCK_N, BLOCK_D), (1, 0))
-    do_blk = tl.make_block_ptr(base_do_offs, (N, D),
-                            (stride_don, stride_dod), (inner_loop_start, 0),
-                            (BLOCK_M, BLOCK_D), (1, 0))
-    l_blk = tl.make_block_ptr(base_l_offs, (N,),
-                              (stride_ln,), (inner_loop_start,),
-                              (BLOCK_M,), (0,))
-    d_blk = tl.make_block_ptr(base_delta_offs, (N,),
-                              (stride_del_n,), (inner_loop_start,),
-                              (BLOCK_M,), (0,))
+    #make tensor descriptors for TMA
+    q_desc = tl.make_tensor_descriptor(base_q_offs, [N, D],
+                                       [stride_qn, stride_qd], [BLOCK_M, BLOCK_D])
+    k_desc = tl.make_tensor_descriptor(base_k_offs, [N, D],
+                                       [stride_kn, stride_kd], [BLOCK_N, BLOCK_D])
+    v_desc = tl.make_tensor_descriptor(base_v_offs, [N, D],
+                                       [stride_vn, stride_vd], [BLOCK_N, BLOCK_D])
+    do_desc = tl.make_tensor_descriptor(base_do_offs, [N, D],
+                                       [stride_don, stride_dod], [BLOCK_M, BLOCK_D])
     
     #load data
-    offs_n = n_start + tl.arange(0, BLOCK_N)
-    offs_d = tl.arange(0, BLOCK_D)
-    mask_n_store = offs_n[:, None] < N
-    mask_n = offs_n[None, :] < N
-    k = tl.load(k_blk, boundary_check=(1, 0), padding_option='zero')
-    v = tl.load(v_blk, boundary_check=(1, 0), padding_option='zero')
+    k = k_desc.load([n_start, 0])
+    v = v_desc.load([n_start, 0])
     dk = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
     dv = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
 
@@ -235,10 +248,10 @@ def flash_attn_bwd_dk_dv(Q, K, V, dO, dK, dV, L, delta,
         STAGE = 1
         if causal is True:
             STAGE = 2 if m_start < n_end else 1
-        q = tl.load(q_blk, boundary_check=(1, 0), padding_option='zero')
-        l = tl.load(l_blk, boundary_check=(0,), padding_option='zero')
-        d = tl.load(d_blk, boundary_check=(0,), padding_option='zero')
-        do = tl.load(do_blk, boundary_check=(1, 0), padding_option='zero')
+        q = q_desc.load([m_start, 0])
+        d = tl.load(d_offs, mask=offs_m < N, other=0.0)
+        l = tl.load(l_offs, mask=offs_m < N, other=0.0)
+        do = do_desc.load([m_start, 0])
 
         #calculate dK/dV
         dk_j, dv_j = flash_attn_bwd_dk_dv_inner(q, k, v, l, d, do, N,
@@ -250,10 +263,9 @@ def flash_attn_bwd_dk_dv(Q, K, V, dO, dK, dV, L, delta,
         dv += dv_j
 
         #advance pointers
-        q_blk = tl.advance(q_blk, (BLOCK_M, 0))
-        do_blk = tl.advance(do_blk, (BLOCK_M, 0))
-        l_blk = tl.advance(l_blk, (BLOCK_M,))
-        d_blk = tl.advance(d_blk, (BLOCK_M,))
+        offs_m += BLOCK_M
+        d_offs += BLOCK_M * stride_del_n
+        l_offs += BLOCK_M * stride_ln
     
     #store grads
     tl.store(base_dk_offs + (offs_n[:, None]) * stride_dkn + (offs_d[None, :]) * stride_dkd, dk, mask=mask_n_store)
@@ -271,6 +283,7 @@ def flash_attn_bwd_dq_inner(q, k, v, l, d, do,
     offs_n = n_start + tl.arange(0, BLOCK_N)
     mask_n = offs_n[None, :] < N
     s_i = tl.where(mask_n, s_i, float('-inf'))
+    s_i = tl.where((offs_m[:, None] < N), s_i, float('-inf'))
     #apply causal mask
     if STAGE == 2:
         mask_causal = offs_m[:, None] >= offs_n[None, :]
@@ -280,13 +293,17 @@ def flash_attn_bwd_dq_inner(q, k, v, l, d, do,
     #calculate gradients
     dp = tl.dot(do, tl.trans(v), allow_tf32=False)
     ds = p_i * (dp - d[:, None])
-    dq = tl.dot(ds, k.to(ds.dtype), allow_tf32=False) * qk_scale
+    dq = tl.dot(ds.to(k.dtype), k, allow_tf32=False) * qk_scale
 
     return dq
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_N': 64, 'BLOCK_M': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_warps=8, num_stages=3),
         triton.Config({'BLOCK_N': 64, 'BLOCK_M': 64}, num_warps=8, num_stages=2),
         triton.Config({'BLOCK_N': 32, 'BLOCK_M': 64}, num_warps=4, num_stages=2),
         triton.Config({'BLOCK_N': 32, 'BLOCK_M': 32}, num_warps=8, num_stages=2),
@@ -311,8 +328,14 @@ def flash_attn_bwd_dq(Q, K, V, dO, dQ, L, delta,
     pid_m = tl.program_id(0)
     batch = pid_bh // H
     head = pid_bh % H
+    m_start = pid_m * BLOCK_M
+    m_start = tl.multiple_of(m_start, BLOCK_M)
+    m_end = min((pid_m + 1) * BLOCK_M, N) if causal else N
 
     #get base offsets
+    offs_m = m_start + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_m = offs_m[:, None] < N
     base_q_offs = Q + (batch * stride_qb) + (head * stride_qh)
     base_k_offs = K + (batch * stride_kb) + (head * stride_kh)
     base_v_offs = V + (batch * stride_vb) + (head * stride_vh)
@@ -320,38 +343,24 @@ def flash_attn_bwd_dq(Q, K, V, dO, dQ, L, delta,
     base_delta_offs = delta + (batch * stride_del_b) + (head * stride_del_h)
     base_do_offs = dO + (batch * stride_dob) + (head * stride_doh)
     base_dq_offs = dQ + (batch * stride_dqb) + (head * stride_dqh)
+    d_offs = base_delta_offs + (offs_m) * stride_del_n
+    l_offs = base_l_offs + (offs_m) * stride_ln
 
-    #make block pointers for TMA
-    m_start = pid_m * BLOCK_M
-    m_start = tl.multiple_of(m_start, BLOCK_M)
-    m_end = min((pid_m + 1) * BLOCK_M, N) if causal else N
-    q_blk = tl.make_block_ptr(base_q_offs, (N, D),
-                            (stride_qn, stride_qd), (m_start, 0),
-                            (BLOCK_M, BLOCK_D), (1, 0))
-    k_blk = tl.make_block_ptr(base_k_offs, (N, D),
-                            (stride_kn, stride_kd), (0, 0),
-                            (BLOCK_N, BLOCK_D), (1, 0))
-    v_blk = tl.make_block_ptr(base_v_offs, (N, D),
-                            (stride_vn, stride_vd), (0, 0),
-                            (BLOCK_N, BLOCK_D), (1, 0))
-    do_blk = tl.make_block_ptr(base_do_offs, (N, D),
-                            (stride_don, stride_dod), (m_start, 0),
-                            (BLOCK_M, BLOCK_D), (1, 0))
-    l_blk = tl.make_block_ptr(base_l_offs, (N,),
-                              (stride_ln,), (m_start,),
-                              (BLOCK_M,), (0,))
-    d_blk = tl.make_block_ptr(base_delta_offs, (N,),
-                              (stride_del_n,), (m_start,),
-                              (BLOCK_M,), (0,))
+    #make tensor descriptors for TMA
+    q_desc = tl.make_tensor_descriptor(base_q_offs, [N, D],
+                                       [stride_qn, stride_qd], [BLOCK_M, BLOCK_D])
+    k_desc = tl.make_tensor_descriptor(base_k_offs, [N, D],
+                                       [stride_kn, stride_kd], [BLOCK_N, BLOCK_D])
+    v_desc = tl.make_tensor_descriptor(base_v_offs, [N, D],
+                                       [stride_vn, stride_vd], [BLOCK_N, BLOCK_D])
+    do_desc = tl.make_tensor_descriptor(base_do_offs, [N, D],
+                                       [stride_don, stride_dod], [BLOCK_M, BLOCK_D])
     
     #load data
-    offs_m = m_start + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, BLOCK_D)
-    mask_m = offs_m[:, None] < N
-    l = tl.load(l_blk, boundary_check=(0,), padding_option='zero')
-    d = tl.load(d_blk, boundary_check=(0,), padding_option='zero')
-    q = tl.load(q_blk, boundary_check=(1, 0), padding_option='zero')
-    do = tl.load(do_blk, boundary_check=(1, 0), padding_option='zero')
+    q = q_desc.load([m_start, 0])
+    do = do_desc.load([m_start, 0])
+    d = tl.load(d_offs, mask=offs_m < N, other=0.0)
+    l = tl.load(l_offs, mask=offs_m < N, other=0.0)
     dq = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
 
     for n_start in range(0, m_end, BLOCK_N):
@@ -361,8 +370,8 @@ def flash_attn_bwd_dq(Q, K, V, dO, dQ, L, delta,
         if causal is True:
             n_end = n_start + BLOCK_N
             STAGE = 2 if m_start < n_end else 1
-        k = tl.load(k_blk, boundary_check=(1, 0), padding_option='zero')
-        v = tl.load(v_blk, boundary_check=(1, 0), padding_option='zero')
+        k = k_desc.load([n_start, 0])
+        v = v_desc.load([n_start, 0])
 
         #calculate dq
         dq_j = flash_attn_bwd_dq_inner(q, k, v, l, d, do,
@@ -372,22 +381,15 @@ def flash_attn_bwd_dq(Q, K, V, dO, dQ, L, delta,
         #accumulate grads
         dq += dq_j
 
-        #advance pointers
-        k_blk = tl.advance(k_blk, (BLOCK_N, 0))
-        v_blk = tl.advance(v_blk, (BLOCK_N, 0))
-
     #store dq
     tl.store(base_dq_offs + (offs_m[:, None]) * stride_dqn + (offs_d[None, :]) * stride_dqd, dq, mask=mask_m)
 
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 128}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 128}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_M': 64}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 64}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_M': 32}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_M': 32}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 128}, num_warps=8),
+        triton.Config({'BLOCK_M': 256}, num_warps=8),
+        triton.Config({'BLOCK_M': 512}, num_warps=8),
     ],
     key=['BLOCK_D'],
 )
@@ -411,39 +413,25 @@ def flash_attn_bwd_delta(O, dO, delta,
 
     #make block ptrs
     m_start = pid_m * BLOCK_M
-    o_blk = tl.make_block_ptr(base_o_offs, (N, D),
-                            (stride_on, stride_od), (m_start, 0),
-                            (BLOCK_M, BLOCK_D), (1, 0))
-    do_blk = tl.make_block_ptr(base_do_offs, (N, D),
-                            (stride_don, stride_dod), (m_start, 0),
-                            (BLOCK_M, BLOCK_D), (1, 0))
+    do_desc = tl.make_tensor_descriptor(base_do_offs, [N, D],
+                                       [stride_don, stride_dod], [BLOCK_M, BLOCK_D])
+    o_desc = tl.make_tensor_descriptor(base_o_offs, [N, D],
+                                       [stride_on, stride_od], [BLOCK_M, BLOCK_D])
     
     #load data
-    o = tl.load(o_blk, boundary_check=(1, 0), padding_option='zero')
-    do = tl.load(do_blk, boundary_check=(1, 0), padding_option='zero')
+    o = o_desc.load([m_start, 0])
+    do = do_desc.load([m_start, 0])
 
     #get delta and store
     _delta = o.to(tl.float32) * do.to(tl.float32)
     _delta = tl.sum(_delta, axis=1)
     m_offs = m_start + tl.arange(0, BLOCK_M)
     tl.store(base_delta_offs + (m_offs) * stride_del_n, _delta, mask=(m_offs < N))
+
+    
+#++++++++++++++ MY FLASH ATTENTION 2 IMPLEMENTATION END ++++++++++++++
  
 def custom_attention_fwd(q, k, v, causal, sm_scale):
-    """
-    TODO: wire this up to your Triton kernel.
- 
-    Expected contract (match this to whatever you settle on in the kernel):
-      q, k, v: (B, H, N, D) contiguous, same dtype
-      returns: out (B, H, N, D) same dtype as input
-               L   (B, H, N)    fp32, logsumexp per row (natural log, NOT log2 --
-                                convert back if your kernel stores log2 internally)
- 
-    Example wiring once your kernel + Python launcher exist:
- 
-        from flash_attention2 import attention  # your launcher function
-        out, L = attention(q, k, v, causal, sm_scale)
-        return out, L
-    """
     B, H, N, D = q.shape
     O = torch.zeros_like(q)
     L = torch.zeros((B, H, N), device=q.device, dtype=torch.float32)
