@@ -6,6 +6,7 @@ from torch.optim.adamw import AdamW
 torch.manual_seed(117)
 import numpy as np
 import tiktoken
+from flash_attention.triton.flash_attention2 import custom_flash_attention_2
 
 #load dataset
 '''with open('./dataset/input.txt', 'r', encoding='utf-8') as file:
@@ -126,7 +127,7 @@ class CausalSelfAttention(nn.Module):
         self.register_buffer('v_cache', torch.zeros(batch_size, num_heads, block_size, head_dim))
         self.rope = RoPE()
 
-    def forward(self, tokens, use_cache=False, absolute_pos=0):
+    def forward(self, tokens, use_cache=False, absolute_pos=0, use_flash_attention=False):
         B, T, C = tokens.shape
         wei = self.weights(tokens) #(B, T, 3C)
 
@@ -143,13 +144,17 @@ class CausalSelfAttention(nn.Module):
         #TRAINING 
         if use_cache is False:
             q, k = self.rope(q, k)
-            #calculate scaled QK^t, shape (B, T, T)
-            qkt = q @ k.transpose(-2, -1)
-            qkt_scaled = qkt * k.shape[-1]**(-0.5)
-            qkt_masked = qkt_scaled.masked_fill(self.causal_mask[:T, :T] == 0, float('-inf'))
-            qkt_softmax = F.softmax(qkt_masked, dim=-1)
-            #calculating scaled dot product attention, shape (B, T, C)
-            scaled_dot_attn = qkt_softmax @ v
+            sm_scale = k.shape[-1]**(-0.5)
+            if use_flash_attention is False:
+                #calculate scaled QK^t, shape (B, T, T)
+                qkt = q @ k.transpose(-2, -1)
+                qkt_scaled = qkt * sm_scale
+                qkt_masked = qkt_scaled.masked_fill(self.causal_mask[:T, :T] == 0, float('-inf'))
+                qkt_softmax = F.softmax(qkt_masked, dim=-1)
+                #calculating scaled dot product attention, shape (B, T, C)
+                scaled_dot_attn = qkt_softmax @ v
+            else:
+                scaled_dot_attn, _ = custom_flash_attention_2.apply(q, k, v, True, sm_scale)
         #INFERENCE 
         else:
             q, k = self.rope(q, k, start_pos=absolute_pos)
@@ -202,8 +207,8 @@ class DecoderBlock(nn.Module):
         self.ln2 = LayerNorm()
         self.mlp = MLP()
 
-    def forward(self, x, use_cache=False, absolute_pos=0):
-        x = x + self.attn(self.ln1(x), use_cache, absolute_pos)
+    def forward(self, x, use_cache=False, absolute_pos=0, use_flash_attention=False):
+        x = x + self.attn(self.ln1(x), use_cache, absolute_pos, use_flash_attention)
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -216,10 +221,10 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(embed_dim, vocab_size)
         self.apply(self._init_weights)
 
-    def forward(self, x, y=None, use_cache=False, absolute_pos=0):
+    def forward(self, x, y=None, use_cache=False, absolute_pos=0, use_flash_attention=False):
         x = self.embedding(x)
         for layer in self.mha:
-            x = layer(x, use_cache=use_cache, absolute_pos=absolute_pos)
+            x = layer(x, use_cache=use_cache, absolute_pos=absolute_pos, use_flash_attention=use_flash_attention)
         x = self.ln(x)
         logits = self.lm_head(x)
 
@@ -273,7 +278,7 @@ for step in range(num_iters):
     for _ in range(grad_steps):
         xb, yb = Generate_Batch('train')
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            logits, loss = model(xb, yb)
+            logits, loss = model(xb, yb, use_flash_attention=True)
             loss = loss/grad_steps
         loss.backward()
         loss_accumulator += loss

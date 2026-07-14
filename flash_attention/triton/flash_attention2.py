@@ -166,7 +166,7 @@ def flash_attn_bwd_dk_dv_inner(q, k, v, l, d, do, N,
     p_i = tl.math.exp(s_i * qk_scale - l[:, None])
     #calculate gradients
     dv = tl.dot(tl.trans(p_i.to(do.dtype)), do, allow_tf32=False)
-    dp = tl.dot(do, tl.trans(v), allow_tf32=False)
+    dp = tl.dot(do.to(v.dtype), tl.trans(v), allow_tf32=False)
     ds = p_i * (dp - d[:, None])
     dk = tl.dot(tl.trans(ds.to(q.dtype)), q, allow_tf32=False) * qk_scale
 
@@ -292,7 +292,7 @@ def flash_attn_bwd_dq_inner(q, k, v, l, d, do,
     #calculate output
     p_i = tl.math.exp(s_i * qk_scale - l[:, None])
     #calculate gradients
-    dp = tl.dot(do, tl.trans(v), allow_tf32=False)
+    dp = tl.dot(do.to(v.dtype), tl.trans(v), allow_tf32=False)
     ds = p_i * (dp - d[:, None])
     dq = tl.dot(ds.to(k.dtype), k, allow_tf32=False) * qk_scale
 
@@ -432,12 +432,14 @@ def flash_attn_bwd_delta(O, dO, delta,
 class custom_flash_attention_2(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, causal, sm_scale):
+        triton.set_allocator(alloc_fn)
+
         B, H, N, D = q.shape
         O = torch.zeros_like(q)
         L = torch.zeros((B, H, N), device=q.device, dtype=torch.float32)
         grid = lambda META: (triton.cdiv(N, META['BLOCK_M']), B * H)
         flash_attn_fwd_kernel_2[grid](q, k, v, O, L,
-                                    B, H, N,
+                                    B, H, N, D,
                                     q.stride(0), q.stride(1), q.stride(2), q.stride(3),
                                     k.stride(0), k.stride(1), k.stride(2), k.stride(3),
                                     v.stride(0), v.stride(1), v.stride(2), v.stride(3),
@@ -454,6 +456,8 @@ class custom_flash_attention_2(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output, grad_L=None):
+        triton.set_allocator(alloc_fn)
+
         q, k, v, o, L = ctx.saved_tensors
         sm_scale = ctx.sm_scale
         causal = ctx.causal
