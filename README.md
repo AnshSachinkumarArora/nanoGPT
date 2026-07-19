@@ -4,4 +4,5 @@ The model has been extended beyond the original scope through the implementation
     - Tiktoken BPE\
     - RoPE\
     - KV Caching \
-    - In Progress: Triton Flash Attention 2 implementation (Fwd/Bwd Pass)
+    - Triton Flash Attention 2 implementation (Fwd/Bwd Pass)
+
