@@ -7,6 +7,7 @@ torch.manual_seed(117)
 import numpy as np
 import tiktoken
 from flash_attention.triton.flash_attention2 import custom_flash_attention_2
+import time
 
 #load dataset
 '''with open('./dataset/input.txt', 'r', encoding='utf-8') as file:
@@ -271,6 +272,10 @@ model = model.to(device)
 #training loop
 optimizer = AdamW(model.parameters(), lr=learning_rate)
 #splitting into mini_batches due to gpu memory constraints
+
+#time training loop
+start_time = time.perf_counter()
+
 grad_steps = int(batch_size/mini_batch_size)
 for step in range(num_iters):
     optimizer.zero_grad(set_to_none=True)
@@ -285,4 +290,8 @@ for step in range(num_iters):
     if step % 100 == 0: print(f'the loss is {loss_accumulator} on step {step}')
     optimizer.step()
 
+end_time = time.perf_counter()
+
+execution_time = end_time - start_time
+print(f"Execution time: {execution_time:.6f} seconds")
 print(encoder.decode(model.generate(idx=torch.zeros((1,1), dtype=torch.long, device=device), max_tokens=min(max_seq_len, 256), use_cache=True)[0].tolist()))
