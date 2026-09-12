@@ -3,11 +3,13 @@ import torch.nn as nn
 from torch.nn import functional as F
 import torch.backends.mps as mps
 from torch.optim.adamw import AdamW
-torch.manual_seed(117)
 import numpy as np
 import tiktoken
-from flash_attention.triton.flash_attention2 import custom_flash_attention_2
+from triton_flash_attention.flash_attention import custom_flash_attention_2
 import time
+
+## set seed
+torch.manual_seed(117)
 
 ## hyperparams
 if torch.cuda.is_available():
