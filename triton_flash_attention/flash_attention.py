@@ -1,4 +1,6 @@
-from flash_attention_kernel import *
+import triton
+import torch
+from .flash_attention_kernel import (flash_attn_fwd, flash_attn_bwd_delta, flash_attn_bwd_dk_dv, flash_attn_bwd_dq, alloc_fn)
 
 class custom_flash_attention_2(torch.autograd.Function):
     @staticmethod

@@ -4,3 +4,5 @@ triton
 torch
 numpy < 2.0
 tiktoken
+setuptools
+pytest

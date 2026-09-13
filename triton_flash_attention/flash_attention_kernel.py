@@ -2,14 +2,12 @@ import os
 import torch
 import torch.nn.functional as F
 import math
-import pytest 
-import triton_flash_attention
+import pytest
+import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 from typing import Optional
-torch.manual_seed(0)
-
-__all__ = ['custom_flash_attention_2']
+torch.manual_seed(117)
 
 def alloc_fn(size: int, alignment: int, stream: Optional[int]):
     return torch.empty(size, device="cuda", dtype=torch.int8)

@@ -5,7 +5,7 @@ import torch.backends.mps as mps
 from torch.optim.adamw import AdamW
 import numpy as np
 import tiktoken
-from triton_flash_attention.flash_attention import custom_flash_attention_2
+from triton_flash_attention import custom_flash_attention_2
 import time
 
 ## set seed
@@ -28,7 +28,7 @@ head_dim = embed_dim//num_heads ## hs
 num_iters = 1000
 num_blocks = 1
 learning_rate = 6e-4
-dataset_path = 'dataset/dataset.bin'
+dataset_path = '../dataset/dataset.bin'
 encoder = tiktoken.get_encoding('cl100k_base')
 max_seq_len = 1024
 
