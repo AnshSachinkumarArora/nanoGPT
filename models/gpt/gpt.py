@@ -32,7 +32,7 @@ dataset_path = '../dataset/dataset.bin'
 encoder = tiktoken.get_encoding('cl100k_base')
 max_seq_len = 1024
 
-## dataset creation
+## load dataset
 dataset = np.memmap(dataset_path, dtype=np.uint32, mode='r')
 ## train/val split
 split_size = int(0.9*len(dataset))

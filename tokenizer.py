@@ -4,7 +4,7 @@ import numpy as np
 #import dataset
 with open('./dataset/input.txt', 'r', encoding='utf-8') as file:
     text = file.read()
-file_path = './dataset/dataset.bin'
+file_path = 'dataset/dataset.bin'
 
 #encode dataset
 encoder = tiktoken.get_encoding('cl100k_base')
