@@ -1,8 +1,10 @@
 import argparse
-from models.bigram.model_train import BigramModelTrain, BigramModelGenerate
+from models.bigram.model_train import (BigramModelTrain, BigramModelGenerate)
+from models.gpt.model_train import (GPTModelTrain, GPTModelGenerate)
 
 MODELS = {
-    'bigram': (BigramModelTrain, BigramModelGenerate)
+    'bigram': (BigramModelTrain, BigramModelGenerate),
+    'gpt': (GPTModelTrain, GPTModelGenerate)
 }
 
 def main():
