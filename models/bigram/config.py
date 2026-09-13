@@ -1,6 +1,5 @@
 from dataclasses import dataclass
 import torch
-import torch.backends.mps as mps
 
 @dataclass
 class BigramConfig:

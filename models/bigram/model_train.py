@@ -1,7 +1,7 @@
 import torch
 from torch.optim.adamw import AdamW
 import numpy as np
-from .model import GenerateBatch, BigramModel
+from .model import (GenerateBatch, BigramModel)
 from .config import BigramConfig
 
 ## training loop

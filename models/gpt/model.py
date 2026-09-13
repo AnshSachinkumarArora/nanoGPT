@@ -1,56 +1,22 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-import torch.backends.mps as mps
-from torch.optim.adamw import AdamW
 import numpy as np
-import tiktoken
 from triton_flash_attention import custom_flash_attention_2
-import time
-
-## set seed
 torch.manual_seed(117)
 
-## hyperparams
-if torch.cuda.is_available():
-    device = 'cuda'
-elif mps.is_available():
-    device = 'mps'
-else:
-    device = 'cpu'
-vocab_size = 100256
-embed_dim = 512 ## C
-num_heads = 4 ## nh
-block_size = 256 ## T
-batch_size = 64 ## B
-mini_batch_size = 4
-head_dim = embed_dim//num_heads ## hs
-num_iters = 1000
-num_blocks = 1
-learning_rate = 6e-4
-dataset_path = '../dataset/dataset.bin'
-encoder = tiktoken.get_encoding('cl100k_base')
-max_seq_len = 1024
-
-## load dataset
-dataset = np.memmap(dataset_path, dtype=np.uint32, mode='r')
-## train/val split
-split_size = int(0.9*len(dataset))
-train = dataset[:split_size]
-val = dataset[split_size:]
-
 ## data loader
-def Generate_Batch(split):
-    data = train if split == 'train' else val
-    ix = torch.randint(len(data) - block_size, (mini_batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+def GenerateBatch(data, device, block_size, mini_batch_size):
+    ix = torch.randint(len(data) - block_size, (mini_batch_size,)).tolist()
+    x_np = np.stack([data[i:i+block_size] for i in ix]).astype(np.int64)
+    y_np = np.stack([data[i+1:i+1+block_size] for i in ix]).astype(np.int64)
+    x = torch.from_numpy(x_np).pin_memory().to(device, non_blocking=True)
+    y = torch.from_numpy(y_np).pin_memory().to(device, non_blocking=True)
     return x, y
 
 class LayerNorm(nn.Module):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self, embed_dim) -> None:
+        super().__init__()
         self.alpha = nn.Parameter(torch.ones(embed_dim))
         self.beta = nn.Parameter(torch.zeros(embed_dim))
         self.epsilon = 1e-5
@@ -67,7 +33,7 @@ class Embedding(nn.Module):
     This class will be used to perform the input and positional embedding
     returns a tensor of shape (block_size, embed_dim)
     '''
-    def __init__(self) -> None:
+    def __init__(self, vocab_size, embed_dim) -> None:
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
     
@@ -76,8 +42,8 @@ class Embedding(nn.Module):
         return embedded
     
 class RoPE(nn.Module):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, head_dim, max_seq_len, device):
+        super().__init__()
         ## setting up positions and frequencies
         pos = torch.arange(max_seq_len, device=device)
         freq = 1/(10000**(torch.arange(0, head_dim, 2).float()/head_dim)).to(device=device)
@@ -109,15 +75,17 @@ class RoPE(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, batch_size, block_size, num_heads, embed_dim, max_seq_len, device) -> None:
         super().__init__()
+        self.batch_size, self.block_size, self.num_heads, self.embed_dim = batch_size, block_size, num_heads, embed_dim
+        self.head_dim = embed_dim//num_heads
         self.weights = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
         self.output_weights = nn.Linear(embed_dim, embed_dim, bias=False)
         self.output_weights.NANOGPT_SCALE_INIT = 1
         self.register_buffer('causal_mask', torch.tril(torch.ones(block_size, block_size)))
-        self.register_buffer('k_cache', torch.zeros(batch_size, num_heads, block_size, head_dim))
-        self.register_buffer('v_cache', torch.zeros(batch_size, num_heads, block_size, head_dim))
-        self.rope = RoPE()
+        self.register_buffer('k_cache', torch.zeros(batch_size, num_heads, block_size, self.head_dim))
+        self.register_buffer('v_cache', torch.zeros(batch_size, num_heads, block_size, self.head_dim))
+        self.rope = RoPE(self.head_dim, max_seq_len, device)
 
     def forward(self, tokens, use_cache=False, absolute_pos=0, use_flash_attention=False):
         B, T, C = tokens.shape
@@ -129,9 +97,9 @@ class CausalSelfAttention(nn.Module):
         v = wei[:, :, C*2:]
 
         ## reshape for correct dimensions per head
-        q = q.reshape(B, T, num_heads, head_dim).transpose(1, 2)
-        k = k.reshape(B, T, num_heads, head_dim).transpose(1, 2)
-        v = v.reshape(B, T, num_heads, head_dim).transpose(1, 2)
+        q = q.reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
 
         ## TRAINING 
         if use_cache is False:
@@ -150,12 +118,12 @@ class CausalSelfAttention(nn.Module):
         ## INFERENCE 
         else:
             q, k = self.rope(q, k, start_pos=absolute_pos)
-            cache_pos = absolute_pos % block_size
+            cache_pos = absolute_pos % self.block_size
             ## append to cache
             self.k_cache[:B, :, cache_pos:cache_pos+1, :] = k
             self.v_cache[:B, :, cache_pos:cache_pos+1, :] = v
             ## get correct number of kv values
-            if absolute_pos < block_size:
+            if absolute_pos < self.block_size:
                 k_hist = self.k_cache[:B, :, :absolute_pos+1, :]
                 v_hist = self.v_cache[:B, :, :absolute_pos+1, :]
             else:
@@ -178,8 +146,8 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self, embed_dim) -> None:
+        super().__init__()
         self.fc1 = nn.Linear(embed_dim, embed_dim * 4)
         self.gelu = nn.GELU()
         self.fc2 = nn.Linear(embed_dim * 4, embed_dim)
@@ -192,12 +160,12 @@ class MLP(nn.Module):
         return tokens
     
 class DecoderBlock(nn.Module):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.ln1 = LayerNorm()
-        self.attn = CausalSelfAttention()
-        self.ln2 = LayerNorm()
-        self.mlp = MLP()
+    def __init__(self, batch_size, block_size, num_heads, embed_dim, max_seq_len, device) -> None:
+        super().__init__()
+        self.ln1 = LayerNorm(embed_dim)
+        self.attn = CausalSelfAttention(batch_size, block_size, num_heads, embed_dim, max_seq_len, device)
+        self.ln2 = LayerNorm(embed_dim)
+        self.mlp = MLP(embed_dim)
 
     def forward(self, x, use_cache=False, absolute_pos=0, use_flash_attention=False):
         x = x + self.attn(self.ln1(x), use_cache, absolute_pos, use_flash_attention)
@@ -205,11 +173,12 @@ class DecoderBlock(nn.Module):
         return x
 
 class GPT(nn.Module):
-    def __init__(self, num_blocks, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.embedding = Embedding()
-        self.mha = nn.ModuleList([DecoderBlock() for _ in range(num_blocks)])
-        self.ln = LayerNorm()
+    def __init__(self, num_blocks, batch_size, block_size, num_heads, embed_dim, max_seq_len, vocab_size, device) -> None:
+        super().__init__()
+        self.batch_size, self.block_size, self.num_heads, self.embed_dim = batch_size, block_size, num_heads, embed_dim
+        self.embedding = Embedding(vocab_size, embed_dim)
+        self.mha = nn.ModuleList([DecoderBlock(batch_size, block_size, num_heads, embed_dim, max_seq_len, device) for _ in range(num_blocks)])
+        self.ln = LayerNorm(embed_dim)
         self.lm_head = nn.Linear(embed_dim, vocab_size)
         self.apply(self._init_weights)
 
@@ -233,7 +202,7 @@ class GPT(nn.Module):
     def generate(self, idx, max_tokens, use_cache=False):
         absolute_pos=0
         for _ in range(max_tokens):
-            idx = idx if idx.shape[-1] <= block_size else idx[:, -block_size:]
+            idx = idx if idx.shape[-1] <= self.block_size else idx[:, -self.block_size:]
             if use_cache is False:
                 logits, _ = self(idx, use_cache=use_cache, absolute_pos=absolute_pos)
             else:
@@ -250,39 +219,9 @@ class GPT(nn.Module):
         std = 0.02
         if isinstance(module, nn.Linear):
             if hasattr(module, 'NANOGPT_SCALE_INIT'):
-                std *= (2 * num_blocks) ** (-0.5)
+                std *= (2 * self.num_blocks) ** (-0.5)
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
-
-model = GPT(num_blocks)
-model = model.to(device)
-
-## training loop
-optimizer = AdamW(model.parameters(), lr=learning_rate)
-
-## time training loop
-start_time = time.perf_counter()
-
-## splitting into mini_batches due to gpu memory constraints
-grad_steps = int(batch_size/mini_batch_size)
-for step in range(num_iters):
-    optimizer.zero_grad(set_to_none=True)
-    loss_accumulator = 0.0
-    for _ in range(grad_steps):
-        xb, yb = Generate_Batch('train')
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            logits, loss = model(xb, yb, use_flash_attention=True)
-            loss = loss/grad_steps
-        loss.backward()
-        loss_accumulator += loss
-    if step % 100 == 0: print(f'the loss is {loss_accumulator} on step {step}')
-    optimizer.step()
-
-end_time = time.perf_counter()
-
-execution_time = end_time - start_time
-print(f"Execution time: {execution_time:.6f} seconds")
-print(encoder.decode(model.generate(idx=torch.zeros((1,1), dtype=torch.long, device=device), max_tokens=min(max_seq_len, 256), use_cache=True)[0].tolist()))
