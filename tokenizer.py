@@ -2,7 +2,7 @@ import tiktoken
 import numpy as np
 
 #import dataset
-with open('./dataset/input.txt', 'r', encoding='utf-8') as file:
+with open('dataset/input.txt', 'r', encoding='utf-8') as file:
     text = file.read()
 file_path = 'dataset/dataset.bin'
 
