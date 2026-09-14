@@ -16,6 +16,6 @@ class GPTConfig:
     num_blocks: int = 1
     learning_rate: float = 6e-4
     dataset_path: str = 'dataset/dataset.bin'
-    encoder: function = tiktoken.get_encoding('cl100k_base')
+    encoder: tiktoken.Encoding = tiktoken.get_encoding('cl100k_base')
     max_seq_len: int = 1024
     device: str = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')

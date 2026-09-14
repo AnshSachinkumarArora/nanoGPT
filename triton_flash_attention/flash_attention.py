@@ -12,15 +12,15 @@ class custom_flash_attention_2(torch.autograd.Function):
         L = torch.zeros((B, H, N), device=q.device, dtype=torch.float32)
         grid = lambda META: (triton.cdiv(N, META['BLOCK_M']), B * H)
         flash_attn_fwd[grid](q, k, v, O, L,
-                                    B, H, N, D,
-                                    q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-                                    k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-                                    v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-                                    O.stride(0), O.stride(1), O.stride(2), O.stride(3),
-                                    L.stride(0), L.stride(1), L.stride(2),
-                                    causal, #BLOCK_M=32, #BLOCK_N=32, 
-                                    BLOCK_D=D,
-                                    qk_scale=sm_scale)
+                            B, H, N, D,
+                            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+                            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+                            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+                            O.stride(0), O.stride(1), O.stride(2), O.stride(3),
+                            L.stride(0), L.stride(1), L.stride(2),
+                            causal, #BLOCK_M=32, #BLOCK_N=32, 
+                            BLOCK_D=D,
+                            qk_scale=sm_scale)
         
         ctx.save_for_backward(q, k, v, O, L)
         ctx.sm_scale = sm_scale
