@@ -175,7 +175,7 @@ class DecoderBlock(nn.Module):
 class GPT(nn.Module):
     def __init__(self, num_blocks, batch_size, block_size, num_heads, embed_dim, max_seq_len, vocab_size, device) -> None:
         super().__init__()
-        self.batch_size, self.block_size, self.num_heads, self.embed_dim = batch_size, block_size, num_heads, embed_dim
+        self.batch_size, self.block_size, self.num_heads, self.embed_dim, self.num_blocks = batch_size, block_size, num_heads, embed_dim, num_blocks
         self.embedding = Embedding(vocab_size, embed_dim)
         self.mha = nn.ModuleList([DecoderBlock(batch_size, block_size, num_heads, embed_dim, max_seq_len, device) for _ in range(num_blocks)])
         self.ln = LayerNorm(embed_dim)
@@ -199,12 +199,12 @@ class GPT(nn.Module):
         
         return logits, loss
     
-    def generate(self, idx, max_tokens, use_cache=False):
+    def generate(self, idx, max_tokens, use_cache=False, use_flash_attention=False):
         absolute_pos=0
         for _ in range(max_tokens):
             idx = idx if idx.shape[-1] <= self.block_size else idx[:, -self.block_size:]
             if use_cache is False:
-                logits, _ = self(idx, use_cache=use_cache, absolute_pos=absolute_pos)
+                logits, _ = self(idx, use_cache=use_cache, absolute_pos=absolute_pos, use_flash_attention=use_flash_attention)
             else:
                 latest_token = idx[:, -1:]
                 logits, _ = self(latest_token, use_cache=use_cache, absolute_pos=absolute_pos)

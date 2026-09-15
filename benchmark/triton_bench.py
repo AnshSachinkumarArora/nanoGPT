@@ -14,14 +14,14 @@ for D in [64, 128]:
             configs.append(
                 triton.testing.Benchmark(
                     x_names=["N"],
-                    x_vals=[2**i for i in range(8, 12)],
+                    x_vals=[2**i for i in range(10, 15)],
                     line_arg="provider",
                     line_vals=["triton-fp16", "torch"],
                     line_names=["Triton [FP16]", "Torch [FP16]"],
                     styles=[("red", "-"), ("blue", "-")],
                     ylabel="TFLOPS",
                     plot_name=
-                    f"fused-attention-batch{B}-head{H}-d{D}-mode{mode}-causal={causal}",
+                    f"fused-attention-batch={B}-head={H}-d={D}-mode={mode}-causal={causal}",
                     args={
                         "H": H,
                         "B": B,
@@ -44,9 +44,9 @@ def benchTritonFlashAttention(B, H, N, D, mode, causal, provider, device='cuda')
         sm_scale = 1.0 / math.sqrt(D)
         fn = lambda: triton_fa2(q, k, v, causal, sm_scale)
         if mode == 'bwd':
-            o = fn()
+            o, l = fn()
             dO = torch.rand_like(o)
-            fn = lambda: o.backward(dO)
+            fn = lambda: o.backward(dO, retain_graph=True)
         ms = triton.testing.do_bench(fn)
 
     if 'torch' in provider:
@@ -58,7 +58,7 @@ def benchTritonFlashAttention(B, H, N, D, mode, causal, provider, device='cuda')
         if mode == 'bwd':
             o = fn()
             dO = torch.rand_like(o)
-            fn = lambda: o.backward(dO)
+            fn = lambda: o.backward(dO, retain_graph=True)
         ms = triton.testing.do_bench(fn)
 
     matmul_flops = (2 * N * D * N) * B * H 

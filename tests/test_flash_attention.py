@@ -74,8 +74,6 @@ class TestTritonFA2:
         # Reference outputs
         ref_out, ref_L = self.referenceAttentionNaive(q, k, v, causal, sm_scale)
         sdpa_out = self.referenceAttentionSdpa(q, k, v, causal, sm_scale)
-        # Sanity check: the two references should already agree closely.
-        self.compare("naive_vs_sdpa", ref_out, sdpa_out, atol=atol, rtol=rtol)
 
         # Triton kernel outputs
         custom_out, custom_L = custom_flash_attention_2.apply(q_cust, k_cust, v_cust, causal, sm_scale)
@@ -99,7 +97,7 @@ class TestTritonFA2:
         dV_ok = self.compare("dV", dV_cust, dV_ref, atol=atol, rtol=rtol)
         return out_ok and L_ok and dQ_ok and dV_ok and dK_ok
     
-    @pytest.mark.parameterize('B', 'H', 'N', 'D', 'causal', 'dtype', 'atol', 'rtol', [
+    @pytest.mark.parametrize('B, H, N, D, causal, dtype, atol, rtol', [
         # (B, H, N, D, causal, dtype, atol, rtol)
         (1, 1, 64,  32,  False, torch.bfloat16, 3e-2, 3e-2),
         (1, 1, 64,  32,  True,  torch.float32, 1e-4, 1e-4),

@@ -6,6 +6,9 @@ import time
 from .model import (GenerateBatch, GPT)
 from .config import GPTConfig
 
+## Set default config
+config = GPTConfig()
+
 ## training loop
 def GPTModelTrain(config=None):
     if config == None:
@@ -36,7 +39,7 @@ def GPTModelTrain(config=None):
         for _ in range(grad_steps):
             xb, yb = GenerateBatch(train, config.device, config.block_size, config.mini_batch_size)
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                logits, loss = model(xb, yb, use_flash_attention=True)
+                logits, loss = model(xb, yb, use_flash_attention=config.use_flash_attention)
                 loss = loss/grad_steps
             loss.backward()
             loss_accumulator += loss
@@ -51,4 +54,5 @@ def GPTModelTrain(config=None):
     return model, config.encoder.decode
 
 def GPTModelGenerate(model:GPT, device, max_seq_len):
-    return model.generate(idx=torch.zeros((1,1), dtype=torch.long, device=device), max_tokens=min(max_seq_len, 256), use_cache=True)
+    tokens = model.generate(idx=torch.zeros((1,1), dtype=torch.long, device=device), max_tokens=min(max_seq_len, 256), use_cache=config.use_cache, use_flash_attention=config.use_flash_attention)
+    return tokens[0].tolist()

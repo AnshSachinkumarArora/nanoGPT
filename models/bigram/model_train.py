@@ -48,4 +48,5 @@ def BigramModelTrain(config=None):
 
 ## inference
 def BigramModelGenerate(m: BigramModel, device, max_tokens):
-    return m.generate(idx=torch.zeros((1,1), dtype=torch.long, device=device), max_tokens=max_tokens)[0].tolist()
+    tokens = m.generate(idx=torch.zeros((1,1), dtype=torch.long, device=device), max_tokens=max_tokens)
+    return tokens[0].tolist()
