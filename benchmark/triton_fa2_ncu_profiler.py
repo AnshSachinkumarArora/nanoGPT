@@ -35,13 +35,13 @@ torch.cuda.profiler.start()
 torch.cuda.nvtx.range_push('triton_fa2_forward')
 out, L = run_kernel()
 torch.cuda.synchronize()
-torch.cuda.nvtx.range_pop
+torch.cuda.nvtx.range_pop()
 
 # Backward pass
 torch.cuda.nvtx.range_push('triton_fa2_backward')
 out.backward(dO)
 torch.cuda.synchronize()
-torch.cuda.nvtx.range_pop
+torch.cuda.nvtx.range_pop()
 
 # Stop profiler
 torch.cuda.profiler.stop()
