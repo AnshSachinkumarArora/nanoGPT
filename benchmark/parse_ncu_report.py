@@ -54,14 +54,31 @@ def extract_metrics(report_path):
 
     # Roofline & Arithmetic Intensity Calculations
     print("--- Roofline Math ---")
+    # Get elapsed SM cycles
+    cycles = get_metric("sm__cycles_elapsed.avg")
+
     # FP32 Fused Multiply-Adds (1 FMA = 2 FLOPs)
-    fma_instructions = get_metric("smsp__sass_thread_inst_executed_op_ffma_pred_on")
+    fma_instructions = get_metric("smsp__sass_thread_inst_executed_op_ffma_pred_on.sum")
+    if fma_instructions == 0.0:
+        fma_rate = get_metric("smsp__sass_thread_inst_executed_op_ffma_pred_on.sum.per_cycle_elapsed")
+        fma_instructions = fma_rate * cycles
     total_flops = fma_instructions * 2
 
     # Global Memory Traffic (each sector is 32 bytes)
-    dram_sectors_read = get_metric("dram__sectors_read.sum")
-    dram_sectors_write = get_metric("dram__sectors_write.sum")
+    dram_sectors_read = get_metric("dram__sectors_op_read.sum")
+    if dram_sectors_read == 0.0:
+        dram_sectors_read = get_metric("dram__sectors_read.sum")
+        
+    dram_sectors_write = get_metric("dram__sectors_op_write.sum")
+    if dram_sectors_write == 0.0:
+        dram_sectors_write = get_metric("dram__sectors_write.sum")
+
     total_bytes = (dram_sectors_read + dram_sectors_write) * 32
+
+    print(f'FMA Rate: {fma_rate}')
+    print(f'DRAM sector reads: {dram_sectors_read} DRAM sector writes: {dram_sectors_write}')
+    print(f'Total bytes: {total_bytes}')
+    print(f'Total flops: {total_flops}')
 
     # Calculate Arithmetic Intensity
     if total_bytes > 0:
