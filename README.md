@@ -1,8 +1,15 @@
-# nanoGPT
-This project started as a recreation of nanoGPT/GPT-2.\
-The model has been extended beyond the original scope through the implementation/integration of -\
-    - Tiktoken BPE\
-    - RoPE\
-    - KV Caching \
-    - Triton Flash Attention 2 implementation (Fwd/Bwd Pass)
+
+## nanoGPT
+
+This project started as an implementation of nanoGPT to better understand transformer internals.<br>
+It has since been extended beyond the original scope through the implementation and integration of:<br>
+
+| **Implementation**                     | **Status** |
+| :---------------------------------:    | :---------:|
+| **Triton Flash-Attention 2** (Fwd/Bwd) |     ✅     |
+| **KV-Caching**                         |     ✅     |
+| **RoPE**                               |     ✅     |
+| **TikToken BPE**                       |     ✅     |
+| Quantization                           |     ⬜     |
+| LoRA                                   |     ⬜     |
 
